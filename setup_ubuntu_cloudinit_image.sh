@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Default values
-VMID_DEFAULT="9999"
-VMNAME_DEFAULT="ubuntu-2404-template"
-STORAGE_DEFAULT="mainstorage"
-BRIDGE_DEFAULT="vmbr0"
+#VMID_DEFAULT="9999"
+#VMNAME_DEFAULT="ubuntu-2404-template"
+#STORAGE_DEFAULT="mainstorage"
+#BRIDGE_DEFAULT="vmbr0"
 
 # Function to display usage information
 usage() {
