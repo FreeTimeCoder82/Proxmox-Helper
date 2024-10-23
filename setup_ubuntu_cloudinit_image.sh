@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Default values
-VMID_DEFAULT="100"
+VMID_DEFAULT="9999"
 VMNAME_DEFAULT="ubuntu-2404-template"
-STORAGE_DEFAULT="vms"
+STORAGE_DEFAULT="mainstorage"
 BRIDGE_DEFAULT="vmbr0"
 
 # Function to display usage information
@@ -11,7 +11,7 @@ usage() {
     echo "Usage: $0 [-i VMID] [-n VMNAME] [-s STORAGE] [-b BRIDGE]"
     echo
     echo "Options:"
-    echo "  -i VMID          Set the VM ID (e.g., 100)"
+    echo "  -i VMID          Set the VM ID (e.g., 9999)"
     echo "  -n VMNAME        Set the VM name (e.g., ubuntu-2404-template)"
     echo "  -s STORAGE       Set the storage name (e.g., vms)"
     echo "  -b BRIDGE        Set the network bridge (e.g., vmbr0)"
