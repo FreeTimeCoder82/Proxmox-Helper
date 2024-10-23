@@ -93,7 +93,7 @@ if [ ! -s $IMAGENAME ]; then
     echo "Download failed or file is empty."
     exit 1
 fi
-echo "Download completed successfully."
+echo "Download completed successfully!"
 
 # Ensure the storage exists
 echo "Checking if storage '$STORAGE' exists..."
