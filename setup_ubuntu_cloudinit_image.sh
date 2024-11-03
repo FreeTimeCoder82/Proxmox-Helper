@@ -104,7 +104,7 @@ verify_network() {
     local bridge=$1
     if ! ip link show "$bridge" &>/dev/null; then
         error_exit "Network bridge $bridge does not exist"
-    }
+    fi
     
     # Test internet connectivity
     for i in {1..3}; do
