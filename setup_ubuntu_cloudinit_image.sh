@@ -182,6 +182,40 @@ check_requirements() {
     fi
 }
 
+# Function to wait for LVM operations
+wait_for_lvm() {
+    local volume=$1
+    local max_attempts=30
+    local attempt=1
+    
+    log "INFO" "Waiting for LVM operation to complete..."
+    while [ $attempt -le $max_attempts ]; do
+        if lvs "$volume" &>/dev/null; then
+            sleep 1  # Extra safety pause
+            return 0
+        fi
+        sleep 1
+        ((attempt++))
+    done
+    error_exit "Timeout waiting for LVM operation on $volume"
+}
+
+# Function to ensure disk operations are complete
+ensure_disk_ready() {
+    local vmid=$1
+    local storage=$2
+    
+    log "INFO" "Ensuring disk operations are complete..."
+    
+    # Wait for LVM changes to settle
+    sync
+    sleep 2
+    
+    # Wait for volume to be ready
+    wait_for_lvm "${storage}/vm-${vmid}-disk-0" || \
+    wait_for_lvm "${storage}/base-${vmid}-disk-0"  # Try alternate name format
+}
+
 # Default values
 VMID_DEFAULT="9999"
 VMNAME_DEFAULT="ubuntu-2404-template"
@@ -274,13 +308,24 @@ main() {
     # Import disk with proper waiting period
     log "INFO" "Importing disk image..."
     qm importdisk "${VMID}" "${IMAGENAME}" "${STORAGE}" || error_exit "Failed to import disk"
-    sleep 2
+    ensure_disk_ready "${VMID}" "${STORAGE}"
     
     # Configure VM storage and settings
     log "INFO" "Configuring VM storage and settings..."
     qm set "${VMID}" \
-        --scsihw virtio-scsi-single \
-        --scsi0 "${STORAGE}:vm-${VMID}-disk-0,discard=on,iothread=1" \
+        --scsihw virtio-scsi-single || error_exit "Failed to set SCSI hardware"
+    
+    sleep 2
+    
+    # Use both possible volume names in the configuration
+    if lvs "${STORAGE}/base-${VMID}-disk-0" &>/dev/null; then
+        DISK_VOLUME="base-${VMID}-disk-0"
+    else
+        DISK_VOLUME="vm-${VMID}-disk-0"
+    fi
+    
+    qm set "${VMID}" \
+        --scsi0 "${STORAGE}:${DISK_VOLUME},discard=on,iothread=1" \
         --ide2 "${STORAGE}:cloudinit" \
         --boot order=scsi0 \
         --serial0 socket \
@@ -291,14 +336,15 @@ main() {
         --bios ovmf \
         --machine q35 || error_exit "Failed to configure VM settings"
     
-    # Resize disk
+    ensure_disk_ready "${VMID}" "${STORAGE}"
+    
+    # Resize disk with proper waiting period
     log "INFO" "Resizing disk..."
-    sleep 2
     qm resize "${VMID}" "scsi0" "+${DISK_SIZE}G" || error_exit "Failed to resize disk"
+    ensure_disk_ready "${VMID}" "${STORAGE}"
     
     # Convert to template
     log "INFO" "Converting to template..."
-    sleep 2
     qm template "${VMID}" || error_exit "Failed to convert to template"
     
     # Calculate execution time
