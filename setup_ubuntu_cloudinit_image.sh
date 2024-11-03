@@ -4,206 +4,196 @@
 # Script to create a cloud-init enabled Ubuntu 24.04 template on Proxmox VE
 # =============================================================================
 
-# Function to display usage information
-usage() {
-    echo "Usage: $0 [-i VMID] [-n VMNAME] [-s STORAGE] [-b BRIDGE]"
-    echo
-    echo "Options:"
-    echo "  -i VMID          Set the VM ID (e.g., 9999)"
-    echo "  -n VMNAME        Set the VM name (e.g., ubuntu-2404-template)"
-    echo "  -s STORAGE       Set the storage name (e.g., local-lvm)"
-    echo "  -b BRIDGE        Set the network bridge (e.g., vmbr0)"
-    echo "  -h               Show this help message"
+set -euo pipefail  # Enable strict error handling
+
+# Define log file
+readonly LOG_FILE="/var/log/proxmox-template-creator.log"
+readonly SCRIPT_NAME=$(basename "$0")
+
+# Logging function
+log() {
+    local level=$1
+    shift
+    local message="$*"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+# Error handling function
+error_exit() {
+    local message=$1
+    log "ERROR" "$message"
+    # Cleanup if temporary files exist
+    [ -f "${IMAGENAME:-}" ] && rm -f "${IMAGENAME}"
+    # Cleanup VM if it was partially created
+    if [ -n "${VMID:-}" ] && qm status "$VMID" &>/dev/null; then
+        qm destroy "$VMID" &>/dev/null || true
+    fi
     exit 1
 }
 
-# Function to validate VM ID (must be a number)
-is_valid_vmid() {
-    [[ "$1" =~ ^[0-9]+$ ]]
+# Function to display usage information
+usage() {
+    cat <<EOF
+Usage: $SCRIPT_NAME [-i VMID] [-n VMNAME] [-s STORAGE] [-b BRIDGE] [-m MEMORY] [-c CORES] [-d DISK_SIZE]
+
+Options:
+  -i VMID          Set the VM ID (e.g., 9999)
+  -n VMNAME        Set the VM name (e.g., ubuntu-2404-template)
+  -s STORAGE       Set the storage name (e.g., local-lvm)
+  -b BRIDGE        Set the network bridge (e.g., vmbr0)
+  -m MEMORY        Set the memory in MB (default: 2048)
+  -c CORES         Set the number of CPU cores (default: 1)
+  -d DISK_SIZE     Additional disk size in GB (default: 10)
+  -h               Show this help message
+EOF
+    exit 1
 }
 
-# Function to validate VM Name (must be a valid DNS name)
+# Function to validate VM ID
+is_valid_vmid() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 100 ] && [ "$1" -le 999999999 ]
+}
+
+# Function to validate VM Name
 is_valid_vmname() {
     [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]]
 }
 
-# Default values (used only if the user leaves the prompt empty)
+# Function to check system requirements
+check_requirements() {
+    local required_commands=("wget" "qm" "pvesm")
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            error_exit "Required command '$cmd' not found"
+        fi
+    done
+
+    # Check if running as root
+    if [ "$(id -u)" -ne 0 ]; then
+        error_exit "This script must be run as root"
+    }
+}
+
+# Default values
 VMID_DEFAULT="9999"
 VMNAME_DEFAULT="ubuntu-2404-template"
 STORAGE_DEFAULT="local-lvm"
 BRIDGE_DEFAULT="vmbr0"
+MEMORY_DEFAULT="2048"
+CORES_DEFAULT="1"
+DISK_SIZE_DEFAULT="10"
 
 # Parse command-line arguments
-while getopts ":i:n:s:b:h" opt; do
+while getopts ":i:n:s:b:m:c:d:h" opt; do
     case "${opt}" in
-        i)
-            VMID=${OPTARG}
-            ;;
-        n)
-            VMNAME=${OPTARG}
-            ;;
-        s)
-            STORAGE=${OPTARG}
-            ;;
-        b)
-            BRIDGE=${OPTARG}
-            ;;
-        h)
-            usage
-            ;;
-        *)
-            echo "Invalid option: -${OPTARG}"
-            usage
-            ;;
+        i) VMID=${OPTARG} ;;
+        n) VMNAME=${OPTARG} ;;
+        s) STORAGE=${OPTARG} ;;
+        b) BRIDGE=${OPTARG} ;;
+        m) MEMORY=${OPTARG} ;;
+        c) CORES=${OPTARG} ;;
+        d) DISK_SIZE=${OPTARG} ;;
+        h) usage ;;
+        *) error_exit "Invalid option: -${OPTARG}" ;;
     esac
 done
 
-shift $((OPTIND -1))
+# Use environment variables if set, otherwise use defaults
+VMID=${VMID:-${VMID_ENV:-$VMID_DEFAULT}}
+VMNAME=${VMNAME:-${VMNAME_ENV:-$VMNAME_DEFAULT}}
+STORAGE=${STORAGE:-${STORAGE_ENV:-$STORAGE_DEFAULT}}
+BRIDGE=${BRIDGE:-${BRIDGE_ENV:-$BRIDGE_DEFAULT}}
+MEMORY=${MEMORY:-${MEMORY_ENV:-$MEMORY_DEFAULT}}
+CORES=${CORES:-${CORES_ENV:-$CORES_DEFAULT}}
+DISK_SIZE=${DISK_SIZE:-${DISK_SIZE_ENV:-$DISK_SIZE_DEFAULT}}
 
-# Use environment variables if set
-VMID=${VMID:-${VMID_ENV}}
-VMNAME=${VMNAME:-${VMNAME_ENV}}
-STORAGE=${STORAGE:-${STORAGE_ENV}}
-BRIDGE=${BRIDGE:-${BRIDGE_ENV}}
-
-# Prompt for any variables still not set
-if [ -z "$VMID" ]; then
-    read -p "Enter VM ID (default ${VMID_DEFAULT}): " VMID
-    VMID=${VMID:-$VMID_DEFAULT}
-fi
-
+# Validate inputs
 while ! is_valid_vmid "$VMID"; do
-    echo "Invalid VM ID. Please enter a numeric value."
+    log "WARN" "Invalid VM ID. Please enter a numeric value between 100 and 999999999."
     read -p "Enter VM ID (default ${VMID_DEFAULT}): " VMID
     VMID=${VMID:-$VMID_DEFAULT}
 done
-
-if [ -z "$VMNAME" ]; then
-    read -p "Enter VM Name (default ${VMNAME_DEFAULT}): " VMNAME
-    VMNAME=${VMNAME:-$VMNAME_DEFAULT}
-fi
 
 while ! is_valid_vmname "$VMNAME"; do
-    echo "Invalid VM Name. Use letters, numbers, hyphens, and periods only (max 63 characters)."
+    log "WARN" "Invalid VM Name. Use letters, numbers, hyphens, and periods only (max 63 characters)."
     read -p "Enter VM Name (default ${VMNAME_DEFAULT}): " VMNAME
     VMNAME=${VMNAME:-$VMNAME_DEFAULT}
 done
 
-if [ -z "$STORAGE" ]; then
-    read -p "Enter Storage Name (default ${STORAGE_DEFAULT}): " STORAGE
-    STORAGE=${STORAGE:-$STORAGE_DEFAULT}
-fi
+# Define image variables
+readonly IMAGEPATH="https://cloud-images.ubuntu.com/noble/current/"
+readonly IMAGENAME="noble-server-cloudimg-amd64.img"
+readonly CHECKSUMURL="${IMAGEPATH}SHA256SUMS"
 
-if [ -z "$BRIDGE" ]; then
-    read -p "Enter Network Bridge (default ${BRIDGE_DEFAULT}): " BRIDGE
-    BRIDGE=${BRIDGE:-$BRIDGE_DEFAULT}
-fi
+# Display and log configuration
+log "INFO" "Configuration:"
+log "INFO" "VM ID: $VMID"
+log "INFO" "VM Name: $VMNAME"
+log "INFO" "Storage: $STORAGE"
+log "INFO" "Bridge: $BRIDGE"
+log "INFO" "Memory: $MEMORY MB"
+log "INFO" "Cores: $CORES"
+log "INFO" "Additional Disk Size: $DISK_SIZE GB"
+log "INFO" "Image Path: ${IMAGEPATH}${IMAGENAME}"
 
-# Define other variables
-IMAGEPATH="https://cloud-images.ubuntu.com/noble/current/"
-IMAGENAME="noble-server-cloudimg-amd64.img"
+# Main execution
+main() {
+    check_requirements
 
-# Display configuration
-echo "Using the following configuration:"
-echo "VM ID: $VMID"
-echo "VM Name: $VMNAME"
-echo "Storage: $STORAGE"
-echo "Bridge: $BRIDGE"
-echo "Image Path: ${IMAGEPATH}${IMAGENAME}"
+    # Check if VM ID already exists
+    if qm status "$VMID" &>/dev/null; then
+        error_exit "VM ID $VMID already exists on this Proxmox node"
+    fi
 
-# Check if VM ID already exists
-if qm status "$VMID" &> /dev/null; then
-    echo "Error: VM ID $VMID already exists on this Proxmox node."
-    exit 1
-fi
+    # Download and verify Ubuntu cloud image
+    log "INFO" "Downloading Ubuntu cloud image and checksum..."
+    wget -q "${IMAGEPATH}${IMAGENAME}" -O "${IMAGENAME}" || error_exit "Failed to download image"
+    wget -q "${CHECKSUMURL}" -O SHA256SUMS || error_exit "Failed to download checksum"
+    
+    # Verify checksum
+    log "INFO" "Verifying image checksum..."
+    if ! sha256sum -c --ignore-missing SHA256SUMS; then
+        error_exit "Checksum verification failed"
+    fi
 
-# Download Ubuntu cloud image disk
-echo "Downloading Ubuntu cloud image..."
-wget -q "${IMAGEPATH}${IMAGENAME}" -O "${IMAGENAME}"
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to download the image."
-    exit 1
-fi
+    # Create and configure VM
+    log "INFO" "Creating VM with ID ${VMID}..."
+    qm create "${VMID}" \
+        --name "${VMNAME}" \
+        --memory "$MEMORY" \
+        --cores "$CORES" \
+        --net0 "virtio,bridge=${BRIDGE},firewall=1" || error_exit "Failed to create VM"
 
-# Verify the image was downloaded successfully
-if [ ! -s "${IMAGENAME}" ]; then
-    echo "Error: Downloaded image is empty or not found."
-    exit 1
-fi
-echo "Download completed successfully."
+    log "INFO" "Importing disk image..."
+    qm importdisk "${VMID}" "${IMAGENAME}" "${STORAGE}" || error_exit "Failed to import disk"
 
-# Ensure the storage exists
-echo "Checking if storage '${STORAGE}' exists..."
-if ! pvesm status | grep -qw "${STORAGE}"; then
-    echo "Error: Storage '${STORAGE}' does not exist."
-    rm -f "${IMAGENAME}"
-    exit 1
-fi
-echo "Storage '${STORAGE}' is available."
+    log "INFO" "Configuring VM..."
+    qm set "${VMID}" \
+        --scsihw virtio-scsi-single \
+        --scsi0 "${STORAGE}:vm-${VMID}-disk-0,discard=on,iothread=1" \
+        --ide2 "${STORAGE}:cloudinit" \
+        --boot order=scsi0 \
+        --serial0 socket \
+        --vga serial0 \
+        --ostype l26 \
+        --agent enabled=1,fstrim_cloned_disks=1 \
+        --balloon 1024 \
+        --bios ovmf \
+        --machine q35 || error_exit "Failed to configure VM"
 
-# Create a new virtual machine
-echo "Creating VM with ID ${VMID}..."
-qm create "${VMID}" --name "${VMNAME}" --memory 2048 --cores 1 --net0 virtio,bridge="${BRIDGE}",firewall=1
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to create VM ${VMID}."
-    rm -f "${IMAGENAME}"
-    exit 1
-fi
+    log "INFO" "Resizing disk..."
+    qm resize "${VMID}" "scsi0" "+${DISK_SIZE}G" || error_exit "Failed to resize disk"
 
-# Import the downloaded Ubuntu disk to storage
-echo "Importing the disk image to storage..."
-qm importdisk "${VMID}" "${IMAGENAME}" "${STORAGE}"
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to import disk image."
-    rm -f "${IMAGENAME}"
-    qm destroy "${VMID}"
-    exit 1
-fi
+    log "INFO" "Converting to template..."
+    qm template "${VMID}" || error_exit "Failed to convert to template"
 
-# Configure the VM
-echo "Configuring the VM..."
-qm set "${VMID}" \
-    --scsihw virtio-scsi-single \
-    --scsi0 "${STORAGE}":vm-"${VMID}"-disk-0,discard=on,iothread=1 \
-    --ide2 "${STORAGE}":cloudinit \
-    --boot order=scsi0 \
-    --serial0 socket \
-    --vga serial0 \
-    --ostype l26 \
-    --agent enabled=1,fstrim_cloned_disks=1 \
-    --balloon 1024 \
-    --bios ovmf \
-    --machine q35
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to configure VM ${VMID}."
-    rm -f "${IMAGENAME}"
-    qm destroy "${VMID}"
-    exit 1
-fi
+    # Cleanup
+    log "INFO" "Cleaning up temporary files..."
+    rm -f "${IMAGENAME}" SHA256SUMS
 
-# Resize disk / add 10GB more disk space
-echo "Resizing the disk..."
-qm resize "${VMID}" scsi0 +10G
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to resize the disk."
-    rm -f "${IMAGENAME}"
-    qm destroy "${VMID}"
-    exit 1
-fi
+    log "INFO" "Template creation completed successfully"
+}
 
-# Clean up the downloaded image
-echo "Cleaning up the downloaded image..."
-rm -f "${IMAGENAME}"
-
-# (Optional) Set additional cloud-init user data or network configuration here
-# Example: qm set "${VMID}" --ciuser <username> --sshkeys "<public_key>"
-
-# Convert the VM to a template
-echo "Converting VM to a template..."
-qm template "${VMID}"
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to convert VM ${VMID} to a template."
-    exit 1
-fi
-
-echo "Template creation completed successfully."
+# Execute main function
+main "$@"
