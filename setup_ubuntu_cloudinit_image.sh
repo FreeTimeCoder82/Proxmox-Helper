@@ -84,19 +84,19 @@ check_resources() {
     local available_memory=$(free -m | awk '/^Mem:/{print $7}')
     if [ "$available_memory" -lt "$required_memory" ]; then
         error_exit "Insufficient memory. Required: ${required_memory}MB, Available: ${available_memory}MB"
-    }
+    fi
     
     # Check CPU cores
     local available_cores=$(nproc)
     if [ "$available_cores" -lt "$required_cores" ]; then
         error_exit "Insufficient CPU cores. Required: $required_cores, Available: $available_cores"
-    }
+    fi
     
     # Check storage space
     local available_storage=$(df -BG "$TEMP_DIR" | awk 'NR==2 {print $4}' | sed 's/G//')
     if [ "$available_storage" -lt "$required_storage" ]; then
         error_exit "Insufficient storage space. Required: ${required_storage}GB, Available: ${available_storage}GB"
-    }
+    fi
 }
 
 # Function to verify network connectivity
