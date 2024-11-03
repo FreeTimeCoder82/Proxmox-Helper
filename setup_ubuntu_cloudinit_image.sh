@@ -72,7 +72,7 @@ check_requirements() {
     # Check if running as root
     if [ "$(id -u)" -ne 0 ]; then
         error_exit "This script must be run as root"
-    }
+    fi
 }
 
 # Default values
