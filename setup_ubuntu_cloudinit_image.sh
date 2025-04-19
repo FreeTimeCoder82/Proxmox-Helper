@@ -1,362 +1,247 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # =============================================================================
-# Script to create a cloud-init enabled Ubuntu 24.04 template on Proxmox VE
-# Version: 2.0
+# Proxmox Ubuntu Cloud‑Init Template Builder
+# Version: 3.0 — 2025‑04‑19
+# =============================================================================
+#  - Implements flock‑based locking
+#  - Handles ERR and EXIT traps for reliable cleanup
+#  - Storage‑aware free‑space checks (pvesm)
+#  - Storage‑agnostic disk‑ready checks
+#  - Adds EFI disk when using OVMF
+#  - Auto‑free VMID via pvesh if none supplied
+#  - Cloud‑Init defaults (user, password, ssh key)
+#  - Optional Ubuntu release parameter
+#  - ANSI colours only when running in a tty (disable with NO_COLOR=1)
 # =============================================================================
 
-set -euo pipefail  # Enable strict error handling
-trap 'error_exit "Script interrupted"' INT TERM
+set -eEuo pipefail        # -E: trap ERR in functions and subshells
+trap 'error_exit "Unexpected error on line $LINENO"' ERR
+trap cleanup EXIT         # Always perform cleanup, even on success
 
-# Define constants
+readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/proxmox-template-creator.log"
-readonly SCRIPT_NAME=$(basename "$0")
-readonly LOCK_FILE="/var/run/proxmox-template-creator.lock"
-readonly TEMP_DIR=$(mktemp -d)
+readonly LOCK_FILE="/var/run/${SCRIPT_NAME}.lock"
 readonly RETRY_COUNT=3
 readonly WAIT_TIME=5
 
-# Logging function with log levels and rotation
+# --- Colour handling --------------------------------------------------------
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+    BOLD="$(tput bold)"; GREEN="$(tput setaf 2)"; RED="$(tput setaf 1)"; YELLOW="$(tput setaf 3)"; RESET="$(tput sgr0)"
+else
+    BOLD=""; GREEN=""; RED=""; YELLOW=""; RESET=""
+fi
+
+# --- Logging ----------------------------------------------------------------
 log() {
-    local level=$1
-    shift
-    local message="$*"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    
-    # Rotate log if larger than 10MB
-    if [ -f "$LOG_FILE" ] && [ $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE") -gt 10485760 ]; then
-        mv "$LOG_FILE" "$LOG_FILE.old"
-    fi
-    
-    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+    local lvl="$1"; shift
+    local ts="$(date '+%F %T')"
+    echo "[$ts] [$lvl] $*" | tee -a "$LOG_FILE"
 }
 
-# Enhanced error handling function
 error_exit() {
-    local message=$1
-    log "ERROR" "$message"
-    
-    # Cleanup
-    cleanup
-    
-    # Release lock
-    rm -f "$LOCK_FILE"
-    
+    log "ERROR" "$*"
     exit 1
 }
 
-# Cleanup function
+# --- Locking via flock ------------------------------------------------------
+exec 9>"$LOCK_FILE" || error_exit "Cannot open lock file $LOCK_FILE"
+flock -n 9 || error_exit "Another instance is already running (lock: $LOCK_FILE)"
+
+# --- Global temp dir --------------------------------------------------------
+TEMP_DIR="$(mktemp -d)"
+
+# --- Cleanup ----------------------------------------------------------------
 cleanup() {
-    log "INFO" "Performing cleanup..."
-    
-    # Remove temporary files
-    [ -d "$TEMP_DIR" ] && rm -rf "$TEMP_DIR"
-    [ -f "${IMAGENAME:-}" ] && rm -f "${IMAGENAME}"
-    
-    # Cleanup VM if it was partially created
-    if [ -n "${VMID:-}" ] && qm status "$VMID" &>/dev/null; then
-        log "INFO" "Removing partially created VM ${VMID}..."
-        qm destroy "$VMID" &>/dev/null || true
+    log INFO "Running cleanup …"
+    [[ -d "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR"
+    [[ -f "${IMAGENAME:-}" ]] && rm -f "${IMAGENAME}"
+    if [[ -n "${VMID:-}" ]] && qm status "$VMID" &>/dev/null; then
+        log INFO "Removing partially created VM $VMID …"
+        qm destroy "$VMID" --purge >/dev/null 2>&1 || true
     fi
 }
 
-# Function to acquire lock
-acquire_lock() {
-    if [ -e "$LOCK_FILE" ]; then
-        local pid=$(cat "$LOCK_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
-            error_exit "Another instance is running with PID $pid"
-        else
-            log "WARN" "Removing stale lock file"
-            rm -f "$LOCK_FILE"
-        fi
+# --- Helper: storage‑space check -------------------------------------------
+check_storage_space() {
+    local storage="$1" required_gb="$2"
+    local avail
+    avail="$(pvesm status --storage "$storage" --verbose 2>/dev/null | awk '/Avail/ {print $2}' | sed 's/G//')"
+    if [[ -z "$avail" ]]; then
+        log WARN "Could not determine free space on $storage (skipping size check)."
+        return 0
     fi
-    echo $$ > "$LOCK_FILE"
+    (( avail < required_gb )) && error_exit "Not enough free space on $storage: need ${required_gb}G, have ${avail}G"
 }
 
-# Function to check available resources
-check_resources() {
-    local required_memory=$1
-    local required_cores=$2
-    local required_storage=$3
-    
-    # Check available memory
-    local available_memory=$(free -m | awk '/^Mem:/{print $7}')
-    if [ "$available_memory" -lt "$required_memory" ]; then
-        error_exit "Insufficient memory. Required: ${required_memory}MB, Available: ${available_memory}MB"
+# --- Helper: ensure disk operations done -----------------------------------
+ensure_disk_ready() {
+    local vmid="$1" storage="$2" volume
+    # Volume name may differ (base‑, vm‑ prefix)
+    if pvesm path "$storage:base-${vmid}-disk-0" &>/dev/null; then
+        volume="$(pvesm path "$storage:base-${vmid}-disk-0")"
+    else
+        volume="$(pvesm path "$storage:vm-${vmid}-disk-0")"
     fi
-    
-    # Check CPU cores
-    local available_cores=$(nproc)
-    if [ "$available_cores" -lt "$required_cores" ]; then
-        error_exit "Insufficient CPU cores. Required: $required_cores, Available: $available_cores"
-    fi
-    
-    # Check storage space
-    local available_storage=$(df -BG "$TEMP_DIR" | awk 'NR==2 {print $4}' | sed 's/G//')
-    if [ "$available_storage" -lt "$required_storage" ]; then
-        error_exit "Insufficient storage space. Required: ${required_storage}GB, Available: ${available_storage}GB"
+
+    if [[ -n "$volume" && -b "$volume" && command -v lvs &>/dev/null ]]; then
+        log INFO "Waiting for LVM volume to settle …"
+        for _ in {1..30}; do
+            lvs "$volume" &>/dev/null && { sleep 1; return; } || true
+            sleep 1
+        done
+        error_exit "Timeout waiting for volume $volume"
+    else
+        # For ZFS, Ceph, Directory etc. a simple sync is enough
+        sync; sleep 2
     fi
 }
 
-# Function to verify network connectivity
+# --- Helper: verify network -------------------------------------------------
 verify_network() {
-    local bridge=$1
-    if ! ip link show "$bridge" &>/dev/null; then
-        error_exit "Network bridge $bridge does not exist"
-    fi
-    
-    # Test internet connectivity
-    for i in {1..3}; do
-        if ping -c 1 cloud-images.ubuntu.com &>/dev/null; then
-            return 0
-        fi
-        sleep 2
-    done
-    error_exit "No internet connectivity to download Ubuntu images"
+    local bridge="$1"
+    ip link show "$bridge" &>/dev/null || error_exit "Bridge $bridge does not exist"
+    curl -fsSLI --max-time 3 https://cloud-images.ubuntu.com/ >/dev/null || \
+        error_exit "No internet connectivity to cloud‑image mirror"
 }
 
-# Enhanced usage function with colorized output
+# --- Helper: requirement checks --------------------------------------------
+check_requirements() {
+    local cmds=(wget qm pvesm sha256sum curl ip awk sed pvesh)
+    for c in "${cmds[@]}"; do command -v "$c" >/dev/null 2>&1 || error_exit "Command $c missing"; done
+    [[ $(id -u) -eq 0 ]] || error_exit "Script must run as root"
+    pveversion >/dev/null 2>&1 || error_exit "Not a Proxmox VE system"
+}
+
+# --- Usage ------------------------------------------------------------------
 usage() {
     cat <<EOF
-$(tput bold)Usage: $SCRIPT_NAME [-i VMID] [-n VMNAME] [-s STORAGE] [-b BRIDGE] [-m MEMORY] [-c CORES] [-d DISK_SIZE]$(tput sgr0)
+${BOLD}Usage:${RESET} ${SCRIPT_NAME} [options]
 
 Options:
-  $(tput setaf 2)-i VMID$(tput sgr0)          Set the VM ID (e.g., 9999)
-  $(tput setaf 2)-n VMNAME$(tput sgr0)        Set the VM name (e.g., ubuntu-2404-template)
-  $(tput setaf 2)-s STORAGE$(tput sgr0)       Set the storage name (e.g., local-lvm)
-  $(tput setaf 2)-b BRIDGE$(tput sgr0)        Set the network bridge (e.g., vmbr0)
-  $(tput setaf 2)-m MEMORY$(tput sgr0)        Set the memory in MB (default: 2048)
-  $(tput setaf 2)-c CORES$(tput sgr0)         Set the number of CPU cores (default: 1)
-  $(tput setaf 2)-d DISK_SIZE$(tput sgr0)     Additional disk size in GB (default: 10)
-  $(tput setaf 2)-h$(tput sgr0)               Show this help message
+  -i VMID          Explicit VMID (default: next free ID)
+  -n NAME          VM/Template name (default: ubuntu-2404-template)
+  -s STORAGE       Proxmox storage (default: local-lvm)
+  -b BRIDGE        Network bridge (default: vmbr0)
+  -m MEMORY        Memory in MB (default: 2048)
+  -c CORES         CPU cores (default: 1)
+  -d DISKSIZE      Extra disk size in GB (default: 10)
+  -r RELEASE       Ubuntu release (noble, jammy …; default: noble)
+  -h               Show this help
 EOF
-    exit 1
+    exit 0
 }
 
-# Enhanced input validation functions
-is_valid_vmid() {
-    local id=$1
-    if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -lt 100 ] || [ "$id" -gt 999999999 ]; then
-        return 1
-    fi
-    
-    # Check if ID is already in use
-    if qm status "$id" &>/dev/null; then
-        return 1
-    fi
-    return 0
-}
+# --- Defaults ---------------------------------------------------------------
+VMNAME="ubuntu-2404-template"
+STORAGE="local-lvm"
+BRIDGE="vmbr0"
+MEMORY=2048
+CORES=1
+DISK_SIZE=10
+RELEASE="noble"
+VMID=""
 
-is_valid_vmname() {
-    [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]] && ! qm list | grep -q " $1 "
-}
-
-# Function to verify storage
-verify_storage() {
-    local storage=$1
-    if ! pvesm status | grep -q "^$storage"; then
-        error_exit "Storage '$storage' not found"
-    fi
-}
-
-# Enhanced system requirements check
-check_requirements() {
-    log "INFO" "Checking system requirements..."
-    
-    local required_commands=("wget" "qm" "pvesm" "sha256sum" "ping" "ip")
-    for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            error_exit "Required command '$cmd' not found"
-        fi
-    done
-
-    # Check if running as root
-    if [ "$(id -u)" -ne 0 ]; then
-        error_exit "This script must be run as root"
-    fi
-
-    # Check Proxmox version
-    if ! pveversion &>/dev/null; then
-        error_exit "This script must be run on a Proxmox VE system"
-    fi
-}
-
-# Function to wait for LVM operations
-wait_for_lvm() {
-    local volume=$1
-    local max_attempts=30
-    local attempt=1
-    
-    log "INFO" "Waiting for LVM operation to complete..."
-    while [ $attempt -le $max_attempts ]; do
-        if lvs "$volume" &>/dev/null; then
-            sleep 1  # Extra safety pause
-            return 0
-        fi
-        sleep 1
-        ((attempt++))
-    done
-    error_exit "Timeout waiting for LVM operation on $volume"
-}
-
-# Function to ensure disk operations are complete
-ensure_disk_ready() {
-    local vmid=$1
-    local storage=$2
-    
-    log "INFO" "Ensuring disk operations are complete..."
-    
-    # Wait for LVM changes to settle
-    sync
-    sleep 2
-    
-    # Wait for volume to be ready
-    wait_for_lvm "${storage}/vm-${vmid}-disk-0" || \
-    wait_for_lvm "${storage}/base-${vmid}-disk-0"  # Try alternate name format
-}
-
-# Default values
-VMID_DEFAULT="9999"
-VMNAME_DEFAULT="ubuntu-2404-template"
-STORAGE_DEFAULT="local-lvm"
-BRIDGE_DEFAULT="vmbr0"
-MEMORY_DEFAULT="2048"
-CORES_DEFAULT="1"
-DISK_SIZE_DEFAULT="10"
-
-# Parse command-line arguments
-while getopts ":i:n:s:b:m:c:d:h" opt; do
-    case "${opt}" in
-        i) VMID=${OPTARG} ;;
-        n) VMNAME=${OPTARG} ;;
-        s) STORAGE=${OPTARG} ;;
-        b) BRIDGE=${OPTARG} ;;
-        m) MEMORY=${OPTARG} ;;
-        c) CORES=${OPTARG} ;;
-        d) DISK_SIZE=${OPTARG} ;;
+# --- Parse CLI --------------------------------------------------------------
+while getopts ":i:n:s:b:m:c:d:r:h" opt; do
+    case "$opt" in
+        i) VMID="$OPTARG" ;;
+        n) VMNAME="$OPTARG" ;;
+        s) STORAGE="$OPTARG" ;;
+        b) BRIDGE="$OPTARG" ;;
+        m) MEMORY="$OPTARG" ;;
+        c) CORES="$OPTARG" ;;
+        d) DISK_SIZE="$OPTARG" ;;
+        r) RELEASE="$OPTARG" ;;
         h) usage ;;
-        *) error_exit "Invalid option: -${OPTARG}" ;;
+        *) error_exit "Invalid option -$OPTARG" ;;
     esac
 done
 
-# Use environment variables if set, otherwise use defaults
-VMID=${VMID:-${VMID_ENV:-$VMID_DEFAULT}}
-VMNAME=${VMNAME:-${VMNAME_ENV:-$VMNAME_DEFAULT}}
-STORAGE=${STORAGE:-${STORAGE_ENV:-$STORAGE_DEFAULT}}
-BRIDGE=${BRIDGE:-${BRIDGE_ENV:-$BRIDGE_DEFAULT}}
-MEMORY=${MEMORY:-${MEMORY_ENV:-$MEMORY_DEFAULT}}
-CORES=${CORES:-${CORES_ENV:-$CORES_DEFAULT}}
-DISK_SIZE=${DISK_SIZE:-${DISK_SIZE_ENV:-$DISK_SIZE_DEFAULT}}
+# Auto‑assign free VMID if none given
+if [[ -z "$VMID" ]]; then
+    VMID="$(pvesh get /cluster/nextid)" || error_exit "Could not fetch next free VMID"
+fi
 
-# Define image variables
-readonly IMAGEPATH="https://cloud-images.ubuntu.com/noble/current/"
-readonly IMAGENAME="noble-server-cloudimg-amd64.img"
-readonly CHECKSUMURL="${IMAGEPATH}SHA256SUMS"
+# --- Derived vars -----------------------------------------------------------
+IMAGEPATH="https://cloud-images.ubuntu.com/${RELEASE}/current/"
+IMAGENAME="${RELEASE}-server-cloudimg-amd64.img"
+CHECKSUMURL="${IMAGEPATH}SHA256SUMS"
 
-# Main execution with progress tracking
+# --- Main -------------------------------------------------------------------
 main() {
-    local start_time=$(date +%s)
-    
-    # Acquire lock
-    acquire_lock
-    
-    # Initial checks
+    local start_ts="$(date +%s)"
+
     check_requirements
     verify_network "$BRIDGE"
-    verify_storage "$STORAGE"
-    check_resources "$MEMORY" "$CORES" "$DISK_SIZE"
-    
-    # Create temporary directory
+    check_storage_space "$STORAGE" "$DISK_SIZE"
+
     cd "$TEMP_DIR"
-    
-    # Display configuration
-    log "INFO" "Starting template creation with configuration:"
-    log "INFO" "VM ID: $VMID"
-    log "INFO" "VM Name: $VMNAME"
-    log "INFO" "Storage: $STORAGE"
-    log "INFO" "Bridge: $BRIDGE"
-    log "INFO" "Memory: $MEMORY MB"
-    log "INFO" "Cores: $CORES"
-    log "INFO" "Additional Disk Size: $DISK_SIZE GB"
-    
-    # Download and verify Ubuntu cloud image with retry logic
-    local attempt=1
-    while [ $attempt -le $RETRY_COUNT ]; do
-        log "INFO" "Downloading Ubuntu cloud image (attempt $attempt/$RETRY_COUNT)..."
-        if wget -q "${IMAGEPATH}${IMAGENAME}" -O "${IMAGENAME}" && \
-           wget -q "${CHECKSUMURL}" -O SHA256SUMS && \
-           sha256sum -c --ignore-missing SHA256SUMS; then
+
+    log INFO "Creating Ubuntu ${RELEASE} template (VMID=$VMID) …"
+
+    # Download with retries ------------------------------------------------------------------
+    for (( i=1; i<=RETRY_COUNT; i++ )); do
+        log INFO "Downloading cloud image (attempt $i/$RETRY_COUNT) …"
+        if wget -q "${IMAGEPATH}${IMAGENAME}" -O "$IMAGENAME" && \
+           wget -q "$CHECKSUMURL" -O SHA256SUMS && \
+           grep " $IMAGENAME$" SHA256SUMS | sha256sum -c -; then
             break
         fi
-        
-        [ $attempt -eq $RETRY_COUNT ] && error_exit "Failed to download or verify image after $RETRY_COUNT attempts"
-        
-        log "WARN" "Attempt $attempt failed, retrying in $WAIT_TIME seconds..."
-        sleep $WAIT_TIME
-        ((attempt++))
+        [[ $i -eq RETRY_COUNT ]] && error_exit "Failed to download/verify image after $RETRY_COUNT attempts"
+        log WARN "Download failed, retrying in $WAIT_TIME s …"; sleep "$WAIT_TIME"
     done
-    
-    # Create and configure VM
-    log "INFO" "Creating VM with ID ${VMID}..."
-    qm create "${VMID}" \
-        --name "${VMNAME}" \
+
+    # Create VM -----------------------------------------------------------------------------
+    qm create "$VMID" \
+        --name "$VMNAME" \
         --memory "$MEMORY" \
         --cores "$CORES" \
-        --net0 "virtio,bridge=${BRIDGE},firewall=1" || error_exit "Failed to create VM"
-        
-    # Import disk with proper waiting period
-    log "INFO" "Importing disk image..."
-    qm importdisk "${VMID}" "${IMAGENAME}" "${STORAGE}" || error_exit "Failed to import disk"
-    ensure_disk_ready "${VMID}" "${STORAGE}"
-    
-    # Configure VM storage and settings
-    log "INFO" "Configuring VM storage and settings..."
-    qm set "${VMID}" \
-        --scsihw virtio-scsi-single || error_exit "Failed to set SCSI hardware"
-    
-    sleep 2
-    
-    # Use both possible volume names in the configuration
-    if lvs "${STORAGE}/base-${VMID}-disk-0" &>/dev/null; then
-        DISK_VOLUME="base-${VMID}-disk-0"
+        --net0 "virtio,bridge=${BRIDGE},firewall=1" \
+        --ostype l26 \
+        --agent enabled=1,fstrim_cloned_disks=1 || error_exit "qm create failed"
+
+    # Import disk ---------------------------------------------------------------------------
+    qm importdisk "$VMID" "$IMAGENAME" "$STORAGE" || error_exit "importdisk failed"
+    ensure_disk_ready "$VMID" "$STORAGE"
+
+    # Detect actual disk volume name --------------------------------------------------------
+    if pvesm path "$STORAGE:base-${VMID}-disk-0" &>/dev/null; then
+        DISK_VOL="base-${VMID}-disk-0"
     else
-        DISK_VOLUME="vm-${VMID}-disk-0"
+        DISK_VOL="vm-${VMID}-disk-0"
     fi
-    
-    qm set "${VMID}" \
-        --scsi0 "${STORAGE}:${DISK_VOLUME},discard=on,iothread=1" \
+
+    # Configure VM --------------------------------------------------------------------------
+    qm set "$VMID" \
+        --scsihw virtio-scsi-single \
+        --scsi0 "${STORAGE}:${DISK_VOL},discard=on,iothread=1" \
         --ide2 "${STORAGE}:cloudinit" \
         --boot order=scsi0 \
         --serial0 socket \
         --vga serial0 \
-        --ostype l26 \
-        --agent enabled=1,fstrim_cloned_disks=1 \
         --balloon 1024 \
         --bios ovmf \
-        --machine q35 || error_exit "Failed to configure VM settings"
-    
-    ensure_disk_ready "${VMID}" "${STORAGE}"
-    
-    # Resize disk with proper waiting period
-    log "INFO" "Resizing disk..."
-    qm resize "${VMID}" "scsi0" "+${DISK_SIZE}G" || error_exit "Failed to resize disk"
-    ensure_disk_ready "${VMID}" "${STORAGE}"
-    
-    # Convert to template
-    log "INFO" "Converting to template..."
-    qm template "${VMID}" || error_exit "Failed to convert to template"
-    
-    # Calculate execution time
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    
-    # Cleanup and finish
-    cleanup
-    rm -f "$LOCK_FILE"
-    
-    log "INFO" "Template creation completed successfully in ${duration} seconds"
+        --efidisk0 "${STORAGE}:0,format=raw,size=1M" || error_exit "qm set failed"
+
+    # Resize disk ---------------------------------------------------------------------------
+    qm resize "$VMID" scsi0 "+${DISK_SIZE}G" || error_exit "qm resize failed"
+    ensure_disk_ready "$VMID" "$STORAGE"
+
+    # Cloud‑Init defaults -------------------------------------------------------------------
+    PUBKEY="$(cat ~/.ssh/id_rsa.pub 2>/dev/null || true)"
+    qm set "$VMID" \
+        --ciuser ubuntu \
+        --cipassword changeme \
+        ${PUBKEY:+--sshkeys "$PUBKEY"} \
+        --description "Ubuntu ${RELEASE} template built $(date +%F)" \
+        --tags "template,ubuntu" || error_exit "qm set cloud‑init failed"
+
+    # Convert to template -------------------------------------------------------------------
+    qm template "$VMID" || error_exit "Failed to convert to template"
+
+    local dur=$(( $(date +%s) - start_ts ))
+    log INFO "Template $VMNAME (ID $VMID) created in ${dur}s ✔"
 }
 
-# Execute main function with error handling
 main "$@"
