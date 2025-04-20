@@ -1,115 +1,123 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S bash -eEuo pipefail
+
 # =============================================================================
 # Proxmox Ubuntu Cloud‑Init Template Builder
-# Version: 4.0 — 2025‑04‑19
+# Version: 4.1 — 2025‑04‑20
 # =============================================================================
 #  - flock‑based locking with configurable path
-#  - Cleanup on EXIT, INT, TERM, and ERR (with line‑number reporting)
+#  - Cleanup on EXIT, INT, TERM, and ERR (with function+line reporting)
 #  - "inherit_errexit" where available for safer pipelines
 #  - Storage‑aware free‑space checks (pvesm) plus release validation
 #  - Bigger 4 MiB EFI disk for OVMF
 #  - Password‑less Cloud‑Init user (SSH key only); aborts if no key
 #  - Optional --dry‑run mode (prints qm / pvesm commands only)
 #  - Optional --color=auto|always|never and NO_COLOR env support
-#  - Log file name derived from script base name; rotate‑friendly
+#  - Optional --keyfile/-k to select SSH public key
+#  - Config file /etc/proxmox-template.conf to persist defaults
+#  - Log file rotation‑friendly naming
 # =============================================================================
 
-set -eEuo pipefail
-shopt -s inherit_errexit 2>/dev/null || true
+# shellcheck disable=SC1090
+shopt -s inherit_errexit nullglob 2>/dev/null || true
+umask 077
+
+# -----------------------------------------------------------------------------
+# Optional global defaults – override any of the CLI flags below.              
+# Put key=value pairs in /etc/proxmox-template.conf (no quotes needed).        
+# -----------------------------------------------------------------------------
+[[ -f /etc/proxmox-template.conf ]] && source /etc/proxmox-template.conf
 
 ###############################################################################
 # Globals
 ###############################################################################
-readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_PATH="$(readlink -f "$0")"
+readonly SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
 readonly SCRIPT_BASE="${SCRIPT_NAME%.*}"
 readonly LOG_FILE="/var/log/${SCRIPT_BASE}.log"
 readonly LOCK_FILE="/run/${SCRIPT_BASE}.lock"
 readonly RETRY_COUNT=3
 readonly WAIT_TIME=5
 
-DRY_RUN=0
-COLOR_MODE="auto"   # auto|always|never; overridden by --color
+DRY_RUN=${DRY_RUN:-0}
+COLOR_MODE="${COLOR_MODE:-auto}"   # auto|always|never; overridden by --color
 
 ###############################################################################
-# Colour handling (follows NO_COLOR + --color flag)
+# Colour handling (NO_COLOR & --color)
 ###############################################################################
+declare -Ag C=( [BOLD]="" [GREEN]="" [RED]="" [YELLOW]="" [RESET]="" )
 setup_colors() {
     if [[ -n ${NO_COLOR:-} ]]; then COLOR_MODE="never"; fi
-
-    if [[ $COLOR_MODE == "never" ]]; then
-        BOLD=""; GREEN=""; RED=""; YELLOW=""; RESET=""
-    elif [[ $COLOR_MODE == "always" || ( -t 1 && $COLOR_MODE == "auto" ) ]]; then
-        BOLD="$(tput bold)"; GREEN="$(tput setaf 2)"; RED="$(tput setaf 1)";
-        YELLOW="$(tput setaf 3)"; RESET="$(tput sgr0)"
-    else
-        BOLD=""; GREEN=""; RED=""; YELLOW=""; RESET=""
+    if [[ $COLOR_MODE != "never" && ( $COLOR_MODE == "always" || -t 1 ) ]]; then
+        C[BOLD]="$(tput bold)"
+        C[GREEN]="$(tput setaf 2)"
+        C[RED]="$(tput setaf 1)"
+        C[YELLOW]="$(tput setaf 3)"
+        C[RESET]="$(tput sgr0)"
     fi
 }
 setup_colors
 
 ###############################################################################
-# Logging
+# Logging helpers
 ###############################################################################
 log() {
     local lvl="$1"; shift
-    local ts
-    ts="$(date '+%F %T')"
-    echo "[$ts] [$lvl] $*" | tee -a "$LOG_FILE" >&2
+    printf '[%(%F %T)T] [%s] %b%b%b\n' -1 "$lvl" "${C[BOLD]}" "$*" "${C[RESET]}" \
+        | tee -a "$LOG_FILE" >&2
 }
 
-error_exit() {
-    log ERROR "$*";
-    exit 1;
-}
+die() { log ERROR "$*"; exit 1; }
+warn() { log WARN  "$*"; }
+info() { log INFO  "$*"; }
 
 ###############################################################################
-# Command wrapper (honours --dry‑run)
+# Command wrapper (honours --dry-run)
 ###############################################################################
 run() {
     if (( DRY_RUN )); then
-        log INFO "(dry‑run) $*"
-    else
-        "$@"
+        info "(dry-run) $*"
+        return 0
     fi
+    "$@"
 }
 
 ###############################################################################
 # Locking via flock
 ###############################################################################
-exec 9>"$LOCK_FILE" || error_exit "Cannot open lock file $LOCK_FILE"
-flock -n 9 || error_exit "Another instance is already running (lock: $LOCK_FILE)"
+exec 9>"$LOCK_FILE" || die "Cannot open lock file $LOCK_FILE"
+flock -n 9 || die "Another instance is already running (lock: $LOCK_FILE)"
 
 ###############################################################################
 # Global temp dir
 ###############################################################################
-TEMP_DIR="$(mktemp -d)"
+TEMP_DIR="$(mktemp -d -t "${SCRIPT_BASE}.XXXXXX")"
 
 ###############################################################################
-# Cleanup
+# Cleanup traps
 ###############################################################################
 cleanup() {
-    log INFO "Running cleanup …"
+    info "Running cleanup …"
     [[ -d "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR"
     [[ -f "${IMAGENAME:-}" ]] && rm -f "${IMAGENAME}"
     if [[ -n "${VMID:-}" ]] && qm status "$VMID" &>/dev/null; then
-        log WARN "Removing partially created VM $VMID …"
+        warn "Removing partially created VM $VMID …"
         run qm destroy "$VMID" --purge >/dev/null 2>&1 || true
     fi
 }
-trap 'error_exit "Unexpected error on line $LINENO"' ERR
+trap 'die "Unexpected error in ${FUNCNAME[0]} at line ${LINENO}"' ERR
 trap cleanup EXIT INT TERM
 
 ###############################################################################
-# Helper: storage‑space check
+# Helper: storage-space check
 ###############################################################################
 check_storage_space() {
     local storage="$1" required_gb="$2" avail
     avail="$(pvesm status --storage "$storage" --verbose 2>/dev/null | awk '/Avail/ {print $2}' | sed 's/G//')"
     if [[ -z "$avail" ]]; then
-        log WARN "Could not determine free space on $storage (skipping size check)."
+        warn "Could not determine free space on $storage (skipping size check)."
         return 0
     fi
-    (( avail < required_gb )) && error_exit "Not enough free space on $storage: need ${required_gb}G, have ${avail}G"
+    (( avail < required_gb )) && die "Not enough free space on $storage: need ${required_gb}G, have ${avail}G"
 }
 
 ###############################################################################
@@ -122,14 +130,13 @@ ensure_disk_ready() {
     else
         volume="$(pvesm path "$storage:vm-${vmid}-disk-0")"
     fi
-
     if [[ -n "$volume" && -b "$volume" && command -v lvs &>/dev/null ]]; then
-        log INFO "Waiting for LVM volume to settle …"
+        info "Waiting for LVM volume to settle …"
         for _ in {1..30}; do
-            lvs "$volume" &>/dev/null && { sleep 1; return; } || true
+            lvs --noheadings -o lv_path "$volume" &>/dev/null && { sleep 1; return; } || true
             sleep 1
         done
-        error_exit "Timeout waiting for volume $volume"
+        die "Timeout waiting for volume $volume"
     else
         sync; sleep 2
     fi
@@ -140,9 +147,9 @@ ensure_disk_ready() {
 ###############################################################################
 verify_network() {
     local bridge="$1"
-    ip link show "$bridge" &>/dev/null || error_exit "Bridge $bridge does not exist"
+    ip link show "$bridge" &>/dev/null || die "Bridge $bridge does not exist"
     curl -fsSLI --max-time 3 https://cloud-images.ubuntu.com/ >/dev/null || \
-        error_exit "No internet connectivity to cloud‑image mirror"
+        die "No internet connectivity to cloud‑image mirror"
 }
 
 ###############################################################################
@@ -150,9 +157,9 @@ verify_network() {
 ###############################################################################
 check_requirements() {
     local cmds=(wget qm pvesm sha256sum curl ip awk sed pvesh)
-    for c in "${cmds[@]}"; do command -v "$c" >/dev/null 2>&1 || error_exit "Command $c missing"; done
-    [[ $(id -u) -eq 0 ]] || error_exit "Script must run as root"
-    pveversion >/dev/null 2>&1 || error_exit "Not a Proxmox VE system"
+    for c in "${cmds[@]}"; do command -v "$c" >/dev/null 2>&1 || die "Command $c missing"; done
+    [[ $(id -u) -eq 0 ]] || die "Script must run as root"
+    pveversion >/dev/null 2>&1 || die "Not a Proxmox VE system"
 }
 
 ###############################################################################
@@ -160,7 +167,7 @@ check_requirements() {
 ###############################################################################
 usage() {
     cat <<EOF
-${BOLD}Usage:${RESET} ${SCRIPT_NAME} [options]
+${C[BOLD]}Usage:${C[RESET]} ${SCRIPT_NAME} [options]
 
 Options:
   -i VMID          Explicit VMID (default: next free ID)
@@ -171,6 +178,7 @@ Options:
   -c CORES         CPU cores (default: 1)
   -d DISKSIZE      Extra disk size in GB (default: 10)
   -r RELEASE       Ubuntu release (noble, jammy, mantic …; default: noble)
+  -k KEYFILE       SSH public‑key file (default: first .pub in ~/.ssh)
   -x               Dry-run (print commands only)
   -C MODE          Color output: auto|always|never (default: auto)
   -h               Show this help
@@ -179,21 +187,22 @@ EOF
 }
 
 ###############################################################################
-# Defaults
+# Defaults (may be overridden by config or CLI)
 ###############################################################################
-VMNAME="ubuntu-2404-template"
-STORAGE="local-lvm"
-BRIDGE="vmbr0"
-MEMORY=2048
-CORES=1
-DISK_SIZE=10
-RELEASE="noble"
-VMID=""
+VMNAME="${VMNAME:-ubuntu-2404-template}"
+STORAGE="${STORAGE:-local-lvm}"
+BRIDGE="${BRIDGE:-vmbr0}"
+MEMORY="${MEMORY:-2048}"
+CORES="${CORES:-1}"
+DISK_SIZE="${DISK_SIZE:-10}"
+RELEASE="${RELEASE:-noble}"
+VMID="${VMID:-}"
+KEYFILE="${KEYFILE:-}"
 
 ###############################################################################
 # Parse CLI
 ###############################################################################
-while getopts ":i:n:s:b:m:c:d:r:xC:h" opt; do
+while getopts ":i:n:s:b:m:c:d:r:k:xC:h" opt; do
     case "$opt" in
         i) VMID="${OPTARG}" ;;
         n) VMNAME="${OPTARG}" ;;
@@ -203,26 +212,34 @@ while getopts ":i:n:s:b:m:c:d:r:xC:h" opt; do
         c) CORES="${OPTARG}" ;;
         d) DISK_SIZE="${OPTARG}" ;;
         r) RELEASE="${OPTARG}" ;;
+        k) KEYFILE="${OPTARG}" ;;
         x) DRY_RUN=1 ;;
         C) COLOR_MODE="${OPTARG}"; setup_colors ;;
         h) usage ;;
-        *) error_exit "Invalid option -$OPTARG" ;;
+        *) die "Invalid option -$OPTARG" ;;
     esac
 done
 
 ###############################################################################
+# Basic numeric validations
+###############################################################################
+[[ $MEMORY =~ ^[0-9]+$ ]] || die "MEMORY must be an integer"
+[[ $CORES  =~ ^[0-9]+$ ]] || die "CORES must be an integer"
+[[ $DISK_SIZE =~ ^[0-9]+$ ]] || die "DISKSIZE must be an integer"
+
+###############################################################################
 # Release validation
 ###############################################################################
-case "$RELEASE" in
+case "${RELEASE,,}" in
     noble|jammy|mantic|kinetic|focal) ;;
-    *) error_exit "Unknown or unsupported Ubuntu release '$RELEASE'" ;;
+    *) die "Unknown or unsupported Ubuntu release '$RELEASE'" ;;
 esac
 
 ###############################################################################
 # Auto‑assign free VMID if none given
 ###############################################################################
 if [[ -z "$VMID" ]]; then
-    VMID="$(pvesh get /cluster/nextid)" || error_exit "Could not fetch next free VMID"
+    VMID="$(pvesh get /cluster/nextid)" || die "Could not fetch next free VMID"
 fi
 
 ###############################################################################
