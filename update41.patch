@@ -1,0 +1,153 @@
+--- setup_ubuntu_cloudinit_image.sh.orig	2025-04-19
++++ setup_ubuntu_cloudinit_image.sh	2025-04-20
+@@
+-#!/usr/bin/env bash
++#/usr/bin/env -S bash -eEuo pipefail
+ #
+ # =============================================================================
+-# Proxmox Ubuntu Cloud‑Init Template Builder
+-# Version: 4.0 — 2025‑04‑19
++# Proxmox Ubuntu Cloud‑Init Template Builder
++# Version: 4.1 — 2025‑04‑20
+ # =============================================================================
+-#  - flock‑based locking with configurable path
++#  - flock‑based locking with configurable path
+ #  - Cleanup on EXIT, INT, TERM, and ERR (with line‑number reporting)
+ #  - "inherit_errexit" where available for safer pipelines
+ #  - Storage‑aware free‑space checks (pvesm) plus release validation
+@@
+-set -eEuo pipefail
+-shopt -s inherit_errexit 2>/dev/null || true
++# shellcheck disable=SC1090
++shopt -s inherit_errexit nullglob 2>/dev/null || true
++umask 077
++
++# -----------------------------------------------------------------------------+
++# Optional global Defaults (overrides below).                                  |
++# Put key=value Paare in /etc/proxmox-template.conf to persist site settings.  |
++# -----------------------------------------------------------------------------+
++[[ -f /etc/proxmox-template.conf ]] && source /etc/proxmox-template.conf
+@@
+-readonly SCRIPT_NAME="$(basename "$0")"
+-readonly SCRIPT_BASE="${SCRIPT_NAME%.*}"
++readonly SCRIPT_PATH="$(readlink -f "$0")"
++readonly SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
++readonly SCRIPT_BASE="${SCRIPT_NAME%.*}"
+ readonly LOG_FILE="/var/log/${SCRIPT_BASE}.log"
+ readonly LOCK_FILE="/run/${SCRIPT_BASE}.lock"
+@@
+-TEMP_DIR="$(mktemp -d)"
++TEMP_DIR="$(mktemp -d -t "${SCRIPT_BASE}.XXXXXX")"
+@@ trap cleanup EXIT INT TERM
+-trap 'error_exit "Unexpected error on line $LINENO"' ERR
++trap 'error_exit "Unexpected error in ${FUNCNAME[0]} at line ${LINENO}"' ERR
+@@
+-setup_colors() {
+-    if [[ -n ${NO_COLOR:-} ]]; then COLOR_MODE="never"; fi
+-
+-    if [[ $COLOR_MODE == "never" ]]; then
+-        BOLD=""; GREEN=""; RED=""; YELLOW=""; RESET=""
+-    elif [[ $COLOR_MODE == "always" || ( -t 1 && $COLOR_MODE == "auto" ) ]]; then
+-        BOLD="$(tput bold)"; GREEN="$(tput setaf 2)"; RED="$(tput setaf 1)";
+-        YELLOW="$(tput setaf 3)"; RESET="$(tput sgr0)"
+-    else
+-        BOLD=""; GREEN=""; RED=""; YELLOW=""; RESET=""
+-    fi
+-}
++declare -Ag C=( [BOLD]="" [GREEN]="" [RED]="" [YELLOW]="" [RESET]="" )
++setup_colors() {
++    if [[ -n ${NO_COLOR:-} ]]; then COLOR_MODE="never"; fi
++    if [[ $COLOR_MODE != "never" && ( $COLOR_MODE == "always" || -t 1 ) ]]; then
++        C[BOLD]="$(tput bold)"
++        C[GREEN]="$(tput setaf 2)"
++        C[RED]="$(tput setaf 1)"
++        C[YELLOW]="$(tput setaf 3)"
++        C[RESET]="$(tput sgr0)"
++    fi
++}
+ setup_colors
+@@
+-log() {
+-    local lvl="$1"; shift
+-    local ts
+-    ts="$(date '+%F %T')"
+-    echo "[$ts] [$lvl] $*" | tee -a "$LOG_FILE" >&2
+-}
++log() {
++    local lvl="$1"; shift
++    printf '[%(%F %T)T] [%s] %b%b%b\n' -1 "$lvl" "${C[BOLD]}" "$*" "${C[RESET]}" \
++        | tee -a "$LOG_FILE" >&2
++}
+@@
+-run() {
+-    if (( DRY_RUN )); then
+-        log INFO "(dry‑run) $*"
+-    else
+-        "$@"
+-    fi
+-}
++run() {
++    if (( DRY_RUN )); then
++        log INFO "(dry‑run) $*"
++        return 0
++    fi
++    "$@"
++}
+@@
+-  -i VMID          Explicit VMID (default: next free ID)
++  -i VMID          Explicit VMID (default: next free ID)
+   -n NAME          VM/Template name (default: ubuntu-2404-template)
+...
+   -r RELEASE       Ubuntu release (noble, jammy, mantic …; default: noble)
++  -k KEYFILE       SSH public‑key file (default: first in ~/.ssh/)
+   -x               Dry-run (print commands only)
+   -C MODE          Color output: auto|always|never (default: auto)
+   -h               Show this help
+@@
+-while getopts ":i:n:s:b:m:c:d:r:xC:h" opt; do
++while getopts ":i:n:s:b:m:c:d:r:k:xC:h" opt; do
+     case "$opt" in
+@@
+-        r) RELEASE="${OPTARG}" ;;
++        r) RELEASE="${OPTARG}" ;;
++        k) KEYFILE="${OPTARG}" ;;
+@@
+-case "$RELEASE" in
+-    noble|jammy|mantic|kinetic|focal) ;;
++case "${RELEASE,,}" in
++    noble|jammy|mantic|kinetic|focal) ;;
+     *) error_exit "Unknown or unsupported Ubuntu release '$RELEASE'" ;;
+ esac
+@@
+-PUBKEY="$(cat ~/.ssh/id_rsa.pub 2>/dev/null || true)"
+-[[ -z "$PUBKEY" ]] && error_exit "No SSH public key found (~/.ssh/id_rsa.pub). Aborting for security."
++# --- SSH‑Key Handling ---------------------------------------------------------
++# Falls kein -k gesetzt: 1. verfügbares *.pub aus ~/.ssh nehmen
++if [[ -z ${KEYFILE:-} ]]; then
++    KEYFILE="$(ls -1 ~/.ssh/*.pub 2>/dev/null | head -n1)"
++fi
++[[ -z ${KEYFILE:-} ]] && error_exit "No SSH public key found in ~/.ssh. Aborting."
++PUBKEY="$(<"$KEYFILE")"
+@@ check_storage_space()
+-    local storage="$1" required_gb="$2" avail
++    local storage="$1" required_gb="$2" avail
+@@ run qm create
+-    local create_args=(
++    local create_args=(
+         --name "$VMNAME"
+@@ ensure_disk_ready()
+-    if pvesm path "$storage:base-${vmid}-disk-0" &>/dev/null; then
+-        volume="$(pvesm path "$storage:base-${vmid}-disk-0")"
++    if pvesm path "$storage:base-${vmid}-disk-0" &>/dev/null; then
++        volume="$(pvesm path "$storage:base-${vmid}-disk-0")"
+     else
+-        volume="$(pvesm path "$storage:vm-${vmid}-disk-0")"
++        volume="$(pvesm path "$storage:vm-${vmid}-disk-0")"
+     fi
+@@
+-        for _ in {1..30}; do
+-            lvs "$volume" &>/dev/null && { sleep 1; return; } || true
++        for _ in {1..30}; do
++            lvs --noheadings -o lv_path "$volume" &>/dev/null && { sleep 1; return; } || true
+             sleep 1
+         done
