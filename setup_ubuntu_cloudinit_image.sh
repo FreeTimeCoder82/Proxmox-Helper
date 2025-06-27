@@ -69,6 +69,7 @@ log() {
 die() { log ERROR "$*"; exit 1; }
 warn() { log WARN  "$*"; }
 info() { log INFO  "$*"; }
+error_exit() { die "$@"; }
 
 ###############################################################################
 # Command wrapper (honours --dry-run)
@@ -130,7 +131,7 @@ ensure_disk_ready() {
     else
         volume="$(pvesm path "$storage:vm-${vmid}-disk-0")"
     fi
-    if [[ -n "$volume" && -b "$volume" && command -v lvs &>/dev/null ]]; then
+    if [[ -n "$volume" && -b "$volume" ]] && command -v lvs >/dev/null 2>&1; then
         info "Waiting for LVM volume to settle …"
         for _ in {1..30}; do
             lvs --noheadings -o lv_path "$volume" &>/dev/null && { sleep 1; return; } || true
