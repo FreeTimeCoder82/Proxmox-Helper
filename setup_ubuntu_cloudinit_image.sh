@@ -158,9 +158,13 @@ verify_network() {
 ###############################################################################
 check_requirements() {
     local cmds=(wget qm pvesm sha256sum curl ip awk sed pvesh)
-    for c in "${cmds[@]}"; do command -v "$c" >/dev/null 2>&1 || die "Command $c missing"; done
+    for c in "${cmds[@]}"; do
+        if ! command -v "$c" >/dev/null 2>&1; then
+            die "Required command '$c' not found. Please install it and retry."
+        fi
+    done
     [[ $(id -u) -eq 0 ]] || die "Script must run as root"
-    pveversion >/dev/null 2>&1 || die "Not a Proxmox VE system"
+    pveversion >/dev/null 2>&1 || die "Not a Proxmox VE system (pveversion missing)"
 }
 
 ###############################################################################
@@ -267,16 +271,37 @@ main() {
 
     # Download cloud image with built‑in retry
     log INFO "Downloading cloud image …"
-    if ! wget --tries=$RETRY_COUNT --timeout=15 --waitretry=$WAIT_TIME -q "${IMAGEPATH}${IMAGENAME}" -O "$IMAGENAME"; then
+    if ! curl -fsSLI "$IMAGEPATH$IMAGENAME" >/dev/null; then
+        error_exit "Image URL unreachable: $IMAGEPATH$IMAGENAME"
+    fi
+    if ! wget --tries=$RETRY_COUNT --timeout=15 --waitretry=$WAIT_TIME -q "$IMAGEPATH$IMAGENAME" -O "$IMAGENAME"; then
         error_exit "Failed to download image after ${RETRY_COUNT} attempts"
     fi
 
+    if ! curl -fsSLI "$CHECKSUMURL" >/dev/null; then
+        error_exit "Checksum URL unreachable: $CHECKSUMURL"
+    fi
     wget -q "$CHECKSUMURL" -O SHA256SUMS || error_exit "Failed to download checksum list"
     grep " $IMAGENAME$" SHA256SUMS | sha256sum -c --ignore-missing - || error_exit "Checksum verification failed"
 
     # Ensure we have an SSH key, otherwise abort (password‑less templates only)
-    PUBKEY="$(cat ~/.ssh/id_rsa.pub 2>/dev/null || true)"
-    [[ -z "$PUBKEY" ]] && error_exit "No SSH public key found (~/.ssh/id_rsa.pub). Aborting for security."
+    if [[ -n "$KEYFILE" ]]; then
+        [[ -f "$KEYFILE" ]] || error_exit "Specified key file $KEYFILE not found"
+        PUBKEY="$(cat "$KEYFILE")"
+    else
+        for k in ~/.ssh/*.pub; do
+            [[ -f "$k" ]] || continue
+            KEYFILE="$k"
+            PUBKEY="$(cat "$k")"
+            break
+        done
+    fi
+    if [[ -z "$PUBKEY" ]]; then
+        error_exit "No SSH public key found. Specify one with -k"
+    fi
+    if ! grep -Eq '^ssh-(rsa|ed25519|ecdsa|dss)' <<< "$PUBKEY"; then
+        error_exit "File $KEYFILE does not contain a valid SSH public key"
+    fi
 
     # Create VM
     local create_args=(
